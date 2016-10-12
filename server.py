@@ -35,7 +35,7 @@ def main(args=None):
             config = json.load(json_data_file)
             #Todo: load PGCLI using site-dirs from config file.
             serverList = config['connections']
-    except Error:
+    except Exception:
         config = dict()
         serverList = dict()
 
@@ -45,7 +45,6 @@ def to_str(string):
     return str(string)
 
 def new_server(alias, url, requiresauthkey):
-    global config
     serverList[alias] = {'url':url, 'requiresauthkey':requiresauthkey}
     config['connections'] = serverList
     with open('config.json', mode='w', encoding='utf-8') as configfile:
@@ -94,7 +93,7 @@ def refresh_servers():
                 else:
                     server['connected'] = False
                     del executors[alias]
-            except Error:
+            except Exception:
                 server['connected'] = False
                 del executors[alias]
         else:
@@ -235,7 +234,7 @@ def result(uuid):
                 r["runtime_seconds"] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
             r['transaction_status'] = get_transaction_status_text(executors[r['alias']].conn.get_transaction_status())
         return Response(to_str(json.dumps(result)), mimetype='text/json')
-    except Error:
+    except Exception:
         return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
 
 @app.route("/completions", methods=['POST'])

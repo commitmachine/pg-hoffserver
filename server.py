@@ -1,32 +1,22 @@
 from __future__ import unicode_literals
-import sys, os, site, traceback, logging, threading, json, uuid, datetime, time, psycopg2, sqlparse
+import sys, os, json, uuid, datetime, time, psycopg2, sqlparse
 from flask import Flask, request, Response
 from threading import Lock, Thread
 from collections import defaultdict
+from pgcli.pgexecute import PGExecute
+from pgspecial import PGSpecial
+from pgcli.completion_refresher import CompletionRefresher
+from prompt_toolkit.document import Document
 try:
     from urlparse import urlparse
 except ImportError:
     from urllib.parse import urlparse
-from pgcli.main import PGCli, has_meta_cmd, has_change_path_cmd
-from pgcli.pgexecute import PGExecute
-from pgcli.pgcompleter import PGCompleter
-from pgspecial import PGSpecial
-from pgcli.completion_refresher import CompletionRefresher
-from prompt_toolkit.document import Document
-from pgcli.main import format_output
-global PGCli, need_completion_refresh, need_search_path_refresh
-global has_meta_cmd, has_change_path_cmd
-global psycopg2, sqlparse, PGExecute, PGCompleter, special, CompletionRefresher, format_output, Document
-global serverList
-if sys.version_info < (3,0):
-     str = unicode
 special = PGSpecial()
 from psycopg2.extensions import (TRANSACTION_STATUS_IDLE,
                                 TRANSACTION_STATUS_ACTIVE,
                                 TRANSACTION_STATUS_INTRANS,
                                 TRANSACTION_STATUS_INERROR,
                                 TRANSACTION_STATUS_UNKNOWN)
-
 completers = defaultdict(list)  # Dict mapping urls to pgcompleter objects
 completer_lock = Lock()
 executors = defaultdict(list)  # Dict mapping buffer ids to pgexecutor objects
@@ -34,7 +24,8 @@ executor_lock = Lock()
 bufferConnections = defaultdict(str) #Dict mapping bufferids to connectionstrings
 queryResults = defaultdict(list)
 type_dict = defaultdict(dict)
-global config
+config = {}
+serverList = {}
 
 def main(args=None):
     global serverList
@@ -44,10 +35,14 @@ def main(args=None):
             config = json.load(json_data_file)
             #Todo: load PGCLI using site-dirs from config file.
             serverList = config['connections']
-    except:
+    except Error:
         config = dict()
         serverList = dict()
 
+def to_str(string):
+    if sys.version_info < (3,0):
+         return unicode(string)
+    return str(string)
 
 def new_server(alias, url, requiresauthkey):
     global config
@@ -83,12 +78,11 @@ def connect_server(alias, authkey=None):
         with executor.conn.cursor() as cur:
             cur.execute('SELECT oid, oid::regtype::text FROM pg_type')
             type_dict[alias] = dict(row for row in cur.fetchall())
-        completer = PGCompleter()
         executors[alias] = executor
         refresher.refresh(executor, special=special, callbacks=(
                             lambda c: swap_completer(c, alias)), settings=settings)
-    except psycopg2.Error as e:
-        return {'success':False, 'errormessage':str(e)}
+    except psycopg2.Error:
+        return {'success':False, 'errormessage':to_str(e)}
     return {'alias': alias, 'success':True, 'errormessage':None}
 
 def refresh_servers():
@@ -100,7 +94,7 @@ def refresh_servers():
                 else:
                     server['connected'] = False
                     del executors[alias]
-            except:
+            except Error:
                 server['connected'] = False
                 del executors[alias]
         else:
@@ -132,8 +126,6 @@ def disconnect_server(alias):
             del executors[alias]
 
 def new_executor(url, pwd=None, settings=None):
-    global password
-    password = None
     uri = urlparse(url)
     database = uri.path[1:]  # ignore the leading fwd slash
     dsn = None  # todo: what is this for again
@@ -151,10 +143,9 @@ def format_row(row):
             columns.append(None)
             continue
         try:
-            encoder.encode()
-            columns.append(column)
+            columns.append(encoder.encode(column))
         except TypeError:
-            columns.append(str(column))
+            columns.append(to_str(column))
     return tuple(columns)
 
 def get_transaction_status_text(status):
@@ -188,7 +179,6 @@ def run_sql(alias, sql, uuid):
     with executor_lock:
         with executor.conn.cursor() as cur:
             for n, qr in enumerate(queryResults[uuid]):
-                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 timestamp_ts = time.mktime(datetime.datetime.now().timetuple())
                 currentQuery = queryResults[uuid][n]
                 currentQuery['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -198,8 +188,8 @@ def run_sql(alias, sql, uuid):
                 #run query
                 try:
                     cur.execute(qr['query'])
-                except psycopg2.Error as e:
-                    currentQuery['error'] = str(e)
+                except psycopg2.Error:
+                    currentQuery['error'] = to_str(e)
 
                 if cur.description:
                     currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code, 'type': type_dict[alias][d.type_code]} for d in cur.description]
@@ -222,31 +212,31 @@ app = Flask(__name__)
 def query():
     alias = request.form.get('alias', 'Vagrant')
     sql = request.form['query']
-    uid = str(uuid.uuid1())
+    uid = to_str(uuid.uuid1())
     sstatus = server_status(alias)
     if not sstatus['success']:
-        return Response(str(json.dumps(sstatus)), mimetype='text/json')
+        return Response(to_str(json.dumps(sstatus)), mimetype='text/json')
 
     t = Thread(target=run_sql,
                    args=(alias, sql, uid),
                    name='run_sql')
     t.setDaemon(True)
     t.start()
-    return Response(str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
+    return Response(to_str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
 @app.route("/result/<uuid>")
 def result(uuid):
     result = queryResults[uuid]
     if not result:
-        return Response(str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
     try:
         for r in result:
             if r['executing'] == True:
                 timestamp_ts = time.mktime(datetime.datetime.strptime(r["timestamp"], '%Y-%m-%d %H:%M:%S').timetuple())
                 r["runtime_seconds"] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
             r['transaction_status'] = get_transaction_status_text(executors[r['alias']].conn.get_transaction_status())
-        return Response(str(json.dumps(result)), mimetype='text/json')
-    except:
-        return Response(str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
+        return Response(to_str(json.dumps(result)), mimetype='text/json')
+    except Error:
+        return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
 
 @app.route("/completions", methods=['POST'])
 def completions():
@@ -256,43 +246,43 @@ def completions():
     if alias in completers:
         comps = completers[alias].get_completions(
                     Document(text=query, cursor_position=int(pos)), None)
-        return Response(str(json.dumps([{'text': c.text, 'type': c._display_meta} for c in comps])), mimetype='text/json')
-    return Response(str(json.dumps({'success':False, 'errormessage':'Not connected to server.'})), mimetype='text/json')
+        return Response(to_str(json.dumps([{'text': c.text, 'type': c._display_meta} for c in comps])), mimetype='text/json')
+    return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected to server.'})), mimetype='text/json')
 
 @app.route("/listservers")
 def list_servers():
     refresh_servers()
-    return Response(str(json.dumps(serverList)), mimetype='text/json')
+    return Response(to_str(json.dumps(serverList)), mimetype='text/json')
 
 @app.route("/listconnections")
 def list_connections():
-    return Response(str(json.dumps(get_connections(), indent=4)), mimetype='text/json')
+    return Response(to_str(json.dumps(get_connections(), indent=4)), mimetype='text/json')
 
 @app.route("/connect", methods=['POST'])
 def connect():
     alias = request.form['alias']
     authkey = request.form['authkey']
-    return Response(str(json.dumps(connect_server(alias, authkey))), mimetype='text/json')
+    return Response(to_str(json.dumps(connect_server(alias, authkey))), mimetype='text/json')
 
 @app.route("/addserver", methods=['POST'])
 def addserver():
     alias = request.form['alias']
     if next((s for (a, s) in serverList.items() if a == alias), None):
-        return Response(str(json.dumps({'success':False, 'errormessage':'Server alias already exists.'})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':False, 'errormessage':'Server alias already exists.'})), mimetype='text/json')
     else:
         url = request.form['url']
         requiresauthkey = request.form['requiresauthkey']
         new_server(alias, url, requiresauthkey)
-        return Response(str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
 
 @app.route("/delserver", methods=['POST'])
 def delserver():
     try:
         alias = request.form['alias']
         remove_server(alias)
-        return Response(str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
     except Exception as e:
-        return Response(str(json.dumps({'success':False, 'errormessage':str(e)})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':False, 'errormessage':str(e)})), mimetype='text/json')
 
 if __name__ == "__main__":
     main()

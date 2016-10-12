@@ -33,6 +33,7 @@ executors = defaultdict(list)  # Dict mapping buffer ids to pgexecutor objects
 executor_lock = Lock()
 bufferConnections = defaultdict(str) #Dict mapping bufferids to connectionstrings
 queryResults = defaultdict(list)
+type_dict = defaultdict(dict)
 global config
 
 def main(args=None):
@@ -79,6 +80,9 @@ def connect_server(alias, authkey=None):
     refresher = CompletionRefresher()
     try:
         executor = new_executor(server['url'], authkey)
+        with executor.conn.cursor() as cur:
+            cur.execute('SELECT oid, oid::regtype::text FROM pg_type')
+            type_dict[alias] = dict(row for row in cur.fetchall())
         completer = PGCompleter()
         executors[alias] = executor
         refresher.refresh(executor, special=special, callbacks=(
@@ -198,7 +202,7 @@ def run_sql(alias, sql, uuid):
                     currentQuery['error'] = str(e)
 
                 if cur.description:
-                    currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code} for d in cur.description]
+                    currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code, 'type': type_dict[alias][d.type_code]} for d in cur.description]
                     currentQuery['rows'] = [format_row(row) for row in cur.fetchall()]
 
                 #update query result

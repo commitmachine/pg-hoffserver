@@ -143,6 +143,9 @@ def format_row(row):
     encoder = json.JSONEncoder()
     columns = []
     for column in row:
+        if column is None:
+            columns.append(None)
+            continue
         try:
             encoder.encode()
             columns.append(column)

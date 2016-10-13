@@ -51,7 +51,6 @@ def new_server(alias, url, requiresauthkey):
         json.dump(config, configfile)
 
 def remove_server(alias):
-    global config
     if config['connections'].get(alias):
         del config['connections'][alias]
     if serverList.get(alias):

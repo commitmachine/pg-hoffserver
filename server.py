@@ -1,7 +1,8 @@
-from __future__ import unicode_literals
-import sys, os, json, uuid, datetime, time, psycopg2, sqlparse
+from __future__ import unicode_literals, print_function
+import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, select
 from flask import Flask, request, Response
 from threading import Lock, Thread
+from multiprocessing import Queue
 from collections import defaultdict
 from pgcli.pgexecute import PGExecute
 from pgspecial import PGSpecial
@@ -26,6 +27,7 @@ queryResults = defaultdict(list)
 type_dict = defaultdict(dict)
 config = {}
 serverList = {}
+executor_queues = defaultdict(lambda: Queue())
 
 def main(args=None):
     global serverList
@@ -65,63 +67,86 @@ def connect_server(alias, authkey=None):
         'generate_casing_file' : True,
         'single_connection': True
     }
-    server = next((s for (a, s) in serverList.items() if a == alias), None)
+    server = serverList.get(alias, None)
     if not server:
         return {'alias': alias, 'success':False, 'errormessage':'Unknown alias.'}
     if executors[alias]:
         return {'alias': alias, 'success':False, 'errormessage':'Already connected to server.'}
     refresher = CompletionRefresher()
     try:
-        executor = new_executor(server['url'], authkey)
-        with executor.conn.cursor() as cur:
-            cur.execute('SELECT oid, oid::regtype::text FROM pg_type')
-            type_dict[alias] = dict(row for row in cur.fetchall())
-        executors[alias] = executor
-        refresher.refresh(executor, special=special, callbacks=(
-                            lambda c: swap_completer(c, alias)), settings=settings)
-    except psycopg2.Error:
+        with executor_lock:
+            executor = new_executor(server['url'], authkey)
+            with executor.conn.cursor() as cur:
+                cur.execute('SELECT oid, oid::regtype::text FROM pg_type')
+                type_dict[alias] = dict(row for row in cur.fetchall())
+            executors[alias] = executor
+            refresher.refresh(executor, special=special, callbacks=(
+                                lambda c: swap_completer(c, alias)), settings=settings)
+            serverList[alias]['connected'] = True
+    except psycopg2.Error as e:
         return {'success':False, 'errormessage':to_str(e)}
+
+    #create a queue for this alias and start a worker thread
+    executor_queues[alias] = Queue()
+    t = Thread(target=executor_queue_worker,
+                   args=(alias,),
+                   name='executor_queue_worker')
+    t.setDaemon(True)
+    t.start()
+
     return {'alias': alias, 'success':True, 'errormessage':None}
 
 def refresh_servers():
-    for alias, server in serverList.items():
-        if alias in executors:
-            try:
-                if executors.get(alias).conn.closed == 0:
-                    server['connected'] = True
-                else:
+    with executor_lock:
+        for alias, server in serverList.items():
+            if alias in executors:
+                try:
+                    if executors.get(alias).conn.closed == 0:
+                        server['connected'] = True
+                    else:
+                        server['connected'] = False
+                        del executors[alias]
+                except Exception:
                     server['connected'] = False
                     del executors[alias]
-            except Exception:
+            else:
                 server['connected'] = False
-                del executors[alias]
-        else:
-            server['connected'] = False
 
 def server_status(alias):
-    server = next((s for (a, s) in serverList.items() if a == alias), None)
-    if not server:
-        return {'alias':alias, 'guid':None, 'success':False, 'errormessage':'Unknown alias.'}
-    if executors[alias]:
-        if executors[alias].conn.closed == 1:
-            server['connected'] = False
-            del executors[alias]
+    with executor_lock:
+        server = next((s for (a, s) in serverList.items() if a == alias), None)
+        if not server:
+            return {'alias':alias, 'guid':None, 'success':False, 'errormessage':'Unknown alias.'}
+        if executors[alias]:
+            if executors[alias].conn.closed == 1:
+                server['connected'] = False
+                del executors[alias]
+        if not executors[alias]:
             return {'alias':alias, 'guid':None, 'success':False, 'Url':None, 'errormessage':'Not connected.'}
-    else:
-        return {'alias':alias, 'guid':None, 'success':False, 'Url':None, 'errormessage':None}
-    return {'success':True}
+        return {'success':True}
 
 def disconnect_server(alias):
     if alias not in executors:
+        return {'success':False, 'errormessage':'Not connected.'}
+    server = serverList.get(alias, None)
+    if not server:
         return {'success':False, 'errormessage':'Unknown alias.'}
-    for alias, server in ((a, s) for (a, s) in serverList.items() if a == alias):
-        try:
-            with executors[alias].conn.cursor() as cur:
-                cur.close()
-                server['connected'] = False
-        except psycopg2.OperationalError:
-            server['connected'] = False
-            del executors[alias]
+    else:
+        server['connected'] = False
+        executors[alias].conn.cancel()
+        executors[alias].conn.close()
+        del executors[alias]
+    return {'success':True, 'errormessage':None}
+
+def cancel_execution(alias):
+    if alias not in executors:
+        return {'success':False, 'errormessage':'Not connected.'}
+    server = serverList.get(alias, None)
+    if not server:
+        return {'success':False, 'errormessage':'Unknown alias.'}
+    else:
+        executors[alias].conn.cancel()
+    return {'success':True, 'errormessage':None}
 
 def new_executor(url, pwd=None, settings=None):
     uri = urlparse(url)
@@ -155,26 +180,34 @@ def get_transaction_status_text(status):
         TRANSACTION_STATUS_UNKNOWN: 'unknown'
     }[status]
 
-def run_sql(alias, sql, uuid):
-    for sql in sqlparse.split(sql):
-        queryResults[uuid].append({
-            'alias': alias,
-            'columns': None,
-            'rows': None,
-            'query': sql,
-            'notices': None,
-            'statusmessage': None,
-            'complete': False,
-            'executing': False,
-            'timestamp': None,
-            'runtime_seconds': None,
-            'error':None,
-            'transaction_status':None
-        })
-    executor = executors[alias]
-    if not executor:
-        return
-    with executor_lock:
+def queue_query(alias, sql, uuid):
+    executor_queues[alias].put({'sql': sql, 'uuid': uuid})
+
+def executor_queue_worker(alias):
+    #pick up work from queue
+    while alias in serverList and serverList[alias].get('connected'):
+        query = executor_queues[alias].get(block=True)
+        sql = query['sql']
+        uuid = query['uuid']
+
+        for sql in sqlparse.split(sql):
+            queryResults[uuid].append({
+                'alias': alias,
+                'columns': None,
+                'rows': None,
+                'query': sql,
+                'notices': None,
+                'statusmessage': None,
+                'complete': False,
+                'executing': False,
+                'timestamp': None,
+                'runtime_seconds': None,
+                'error':None,
+                'transaction_status':None
+            })
+        executor = executors[alias]
+        if not executor:
+            return
         with executor.conn.cursor() as cur:
             for n, qr in enumerate(queryResults[uuid]):
                 timestamp_ts = time.mktime(datetime.datetime.now().timetuple())
@@ -186,7 +219,7 @@ def run_sql(alias, sql, uuid):
                 #run query
                 try:
                     cur.execute(qr['query'])
-                except psycopg2.Error:
+                except psycopg2.Error as e:
                     currentQuery['error'] = to_str(e)
 
                 if cur.description:
@@ -214,13 +247,9 @@ def query():
     sstatus = server_status(alias)
     if not sstatus['success']:
         return Response(to_str(json.dumps(sstatus)), mimetype='text/json')
-
-    t = Thread(target=run_sql,
-                   args=(alias, sql, uid),
-                   name='run_sql')
-    t.setDaemon(True)
-    t.start()
+    queue_query(alias, sql, uid)
     return Response(to_str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
+
 @app.route("/result/<uuid>")
 def result(uuid):
     result = queryResults[uuid]
@@ -280,7 +309,25 @@ def delserver():
         remove_server(alias)
         return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
     except Exception as e:
-        return Response(to_str(json.dumps({'success':False, 'errormessage':str(e)})), mimetype='text/json')
+        return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
+
+@app.route("/disconnect", methods=['POST'])
+def disconnect():
+    try:
+        alias = request.form['alias']
+        disconnect_server(alias)
+        return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+    except Exception as e:
+        return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
+
+@app.route("/cancel", methods=['POST'])
+def cancel():
+    try:
+        alias = request.form['alias']
+        cancel_execution(alias)
+        return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+    except Exception as e:
+        return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
 
 if __name__ == "__main__":
     main()

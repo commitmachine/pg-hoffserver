@@ -1,8 +1,9 @@
 from __future__ import unicode_literals, print_function
-import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, select
+import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, sqlite3
 from flask import Flask, request, Response
 from threading import Lock, Thread
 from multiprocessing import Queue
+from Queue import Empty
 from collections import defaultdict
 from pgcli.pgexecute import PGExecute
 from pgspecial import PGSpecial
@@ -18,12 +19,14 @@ from psycopg2.extensions import (TRANSACTION_STATUS_IDLE,
                                 TRANSACTION_STATUS_INTRANS,
                                 TRANSACTION_STATUS_INERROR,
                                 TRANSACTION_STATUS_UNKNOWN)
+home_dir = os.path.expanduser('~/.pghoffserver')
 completers = defaultdict(list)  # Dict mapping urls to pgcompleter objects
 completer_lock = Lock()
 executors = defaultdict(list)  # Dict mapping buffer ids to pgexecutor objects
 executor_lock = Lock()
 bufferConnections = defaultdict(str) #Dict mapping bufferids to connectionstrings
 queryResults = defaultdict(list)
+dbSyncQueue = Queue()
 type_dict = defaultdict(dict)
 config = {}
 serverList = {}
@@ -32,14 +35,52 @@ executor_queues = defaultdict(lambda: Queue())
 def main(args=None):
     global serverList
     global config
+    if not os.path.exists(home_dir):
+        os.makedirs(home_dir)
     try:
-        with open('config.json') as json_data_file:
+        with open(home_dir + '/config.json') as json_data_file:
             config = json.load(json_data_file)
             #Todo: load PGCLI using site-dirs from config file.
             serverList = config['connections']
     except Exception:
         config = dict()
         serverList = dict()
+    init_db()
+
+
+def init_db():
+    sql = """CREATE TABLE IF NOT EXISTS QueryData(
+      alias text, uuid text, columns text, rows text, query text,
+      notices text, statusmessage text,
+      runtime_seconds int, error text,
+      datestamp timestamp
+    )"""
+    conn = sqlite3.connect(home_dir + '/hoff.db')
+    conn.execute(sql)
+    conn.close()
+    t = Thread(target=db_worker,
+                   name='db_worker')
+    t.setDaemon(True)
+    t.start()
+
+def db_worker():
+    conn = sqlite3.connect(home_dir + '/hoff.db')
+    while True:
+        try:
+            q = dbSyncQueue.get(block=True, timeout=60)
+            result = q['result']
+            uuid = q['uuid']
+            for r in result:
+                conn.cursor().execute("insert into QueryData values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) WHERE uuid <> '?';",
+                    (r['alias'], to_str(uuid), to_str(json.dumps(r['columns'])), to_str(json.dumps(r['rows'])),
+                    r['query'], to_str(json.dumps(r['notices'])),
+                    r['statusmessage'], r['runtime_seconds'], r['error'], r['timestamp'], uuid))
+                conn.commit()
+        except Empty:
+            pass
+        #remove old query results from memory
+        #queryResults[:] = [r for r in queryResults
+        #    if r['complete'] and (datetime.strptime(r['timestamp']) - datetime.datetime.now()).seconds + r['runtime_seconds'] > 10]
 
 def to_str(string):
     if sys.version_info < (3,0):
@@ -49,7 +90,7 @@ def to_str(string):
 def new_server(alias, url, requiresauthkey):
     serverList[alias] = {'url':url, 'requiresauthkey':requiresauthkey}
     config['connections'] = serverList
-    with open('config.json', mode='w', encoding='utf-8') as configfile:
+    with open(home_dir + '/config.json', mode='w', encoding='utf-8') as configfile:
         json.dump(config, configfile)
 
 def remove_server(alias):
@@ -57,7 +98,7 @@ def remove_server(alias):
         del config['connections'][alias]
     if serverList.get(alias):
         del serverList[alias]
-    with open('config.json', mode='w', encoding='utf-8') as configfile:
+    with open(home_dir + 'config.json', mode='w', encoding='utf-8') as configfile:
         json.dump(config, configfile)
 
 def connect_server(alias, authkey=None):
@@ -256,11 +297,15 @@ def result(uuid):
     if not result:
         return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
     try:
+        sync_to_db = True
         for r in result:
             if r['executing'] == True:
+                sync_to_db = False
                 timestamp_ts = time.mktime(datetime.datetime.strptime(r["timestamp"], '%Y-%m-%d %H:%M:%S').timetuple())
                 r["runtime_seconds"] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
             r['transaction_status'] = get_transaction_status_text(executors[r['alias']].conn.get_transaction_status())
+        if sync_to_db: #put result in queue for db-storage
+            dbSyncQueue.put({'result': result, 'uuid':uuid})
         return Response(to_str(json.dumps(result)), mimetype='text/json')
     except Exception:
         return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')

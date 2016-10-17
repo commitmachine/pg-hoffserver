@@ -31,6 +31,7 @@ type_dict = defaultdict(dict)
 config = {}
 serverList = {}
 executor_queues = defaultdict(lambda: Queue())
+db_name = 'hoff.db'
 
 def main(args=None):
     global serverList
@@ -47,15 +48,14 @@ def main(args=None):
         serverList = dict()
     init_db()
 
-
 def init_db():
     sql = """CREATE TABLE IF NOT EXISTS QueryData(
-      alias text, uuid text, columns text, rows text, query text,
-      notices text, statusmessage text,
+      alias text, uuid text, dynamic_table_name text, columns text, rows text,
+      query text, notices text, statusmessage text,
       runtime_seconds int, error text,
       datestamp timestamp
     )"""
-    conn = sqlite3.connect(home_dir + '/hoff.db')
+    conn = sqlite3.connect(home_dir + '/' + db_name)
     conn.execute(sql)
     conn.close()
     t = Thread(target=db_worker,
@@ -64,17 +64,17 @@ def init_db():
     t.start()
 
 def db_worker():
-    conn = sqlite3.connect(home_dir + '/hoff.db')
+    conn = sqlite3.connect(home_dir + '/' + db_name)
     while True:
         try:
             q = dbSyncQueue.get(block=True, timeout=60)
             result = q['result']
             uuid = q['uuid']
             for r in result:
-                conn.cursor().execute("insert into QueryData values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) WHERE uuid <> '?';",
-                    (r['alias'], to_str(uuid), to_str(json.dumps(r['columns'])), to_str(json.dumps(r['rows'])),
-                    r['query'], to_str(json.dumps(r['notices'])),
-                    r['statusmessage'], r['runtime_seconds'], r['error'], r['timestamp'], uuid))
+                conn.cursor().execute("INSERT INTO QueryData VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    (r['alias'], to_str(uuid), None, json.dumps(r['columns']), json.dumps(r['rows']),
+                    r['query'], json.dumps(r['notices']),
+                    r['statusmessage'], r['runtime_seconds'], r['error'], r['timestamp']))
                 conn.commit()
         except Empty:
             pass
@@ -90,7 +90,7 @@ def to_str(string):
 def new_server(alias, url, requiresauthkey):
     serverList[alias] = {'url':url, 'requiresauthkey':requiresauthkey}
     config['connections'] = serverList
-    with open(home_dir + '/config.json', mode='w', encoding='utf-8') as configfile:
+    with open(home_dir + '/config.json', mode='w') as configfile:
         json.dump(config, configfile)
 
 def remove_server(alias):
@@ -244,7 +244,8 @@ def executor_queue_worker(alias):
                 'timestamp': None,
                 'runtime_seconds': None,
                 'error':None,
-                'transaction_status':None
+                'transaction_status':None,
+                'dynamic_alias': None
             })
         executor = executors[alias]
         if not executor:
@@ -256,46 +257,68 @@ def executor_queue_worker(alias):
                 currentQuery['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
                 currentQuery['executing'] = True
                 queryResults[uuid][n] = currentQuery
-
+                #Check if there are any dynamic tables in the query
+                query = update_query_with_dynamic_tables(qr['query'])
                 #run query
                 try:
-                    cur.execute(qr['query'])
+                    cur.execute(query)
                 except psycopg2.Error as e:
                     currentQuery['error'] = to_str(e)
-
                 if cur.description:
                     currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code, 'type': type_dict[alias][d.type_code]} for d in cur.description]
                     currentQuery['rows'] = [format_row(row) for row in cur.fetchall()]
-
                 #update query result
                 currentQuery['runtime_seconds'] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
                 currentQuery['complete'] = True
                 currentQuery['executing'] = False
                 currentQuery['statusmessage'] = cur.statusmessage
-
                 notices = []
                 while executor.conn.notices:
                     notices.append(executor.conn.notices.pop(0))
                 currentQuery['notices'] = notices
                 queryResults[uuid][n] = currentQuery
 
-app = Flask(__name__)
-@app.route("/query", methods=['POST'])
-def query():
-    alias = request.form.get('alias', 'Vagrant')
-    sql = request.form['query']
-    uid = to_str(uuid.uuid1())
-    sstatus = server_status(alias)
-    if not sstatus['success']:
-        return Response(to_str(json.dumps(sstatus)), mimetype='text/json')
-    queue_query(alias, sql, uid)
-    return Response(to_str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
+def update_query_with_dynamic_tables(query):
+    dynamic_tables = list_dynamic_tables()
+    if not dynamic_tables:
+        return query
+    for x in dynamic_tables:
+        if '@' + x['dynamic_table_name'] in query:
+            query = query.replace('@' + x['dynamic_table_name'], construct_dynamic_table(x['dynamic_table_name']))
+    return query
 
-@app.route("/result/<uuid>")
-def result(uuid):
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+def fetch_result(uuid):
     result = queryResults[uuid]
     if not result:
-        return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
+        #look for result in db
+        conn = sqlite3.connect(home_dir + '/' + db_name)
+        conn.row_factory = dict_factory
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM QueryData WHERE uuid = ?", (to_str(uuid),))
+        row = cur.fetchone()
+        result = {
+            'alias': row["alias"],
+            'columns': json.loads(row["columns"]),
+            'rows': json.loads(row["rows"]),
+            'query': row["query"],
+            'notices': json.loads(row["notices"]),
+            'statusmessage': row["statusmessage"],
+            'complete': 'lolz',
+            'executing': False,
+            'timestamp': row["datestamp"],
+            'runtime_seconds': row["runtime_seconds"],
+            'error': row["error"]
+        }
+        if result['alias']:
+            return Response(to_str(json.dumps(result)), mimetype='text/json')
+        else:
+            return Response(to_str(json.dumps({'success':False, 'errormessage':'Unknown uuid.'})), mimetype='text/json')
     try:
         sync_to_db = True
         for r in result:
@@ -306,12 +329,83 @@ def result(uuid):
             r['transaction_status'] = get_transaction_status_text(executors[r['alias']].conn.get_transaction_status())
         if sync_to_db: #put result in queue for db-storage
             dbSyncQueue.put({'result': result, 'uuid':uuid})
+            del queryResults[uuid]
         return Response(to_str(json.dumps(result)), mimetype='text/json')
     except Exception:
         return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected.'})), mimetype='text/json')
 
+def create_dynamic_table(uuid, name):
+    conn = sqlite3.connect(home_dir + '/' + db_name)
+    conn.cursor().execute('UPDATE QueryData SET dynamic_table_name = ? WHERE uuid = ?;', (name, to_str(uuid)))
+    conn.commit()
+    conn.close()
+    return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+
+def delete_dynamic_table(uuid = None, alias = None):
+    conn = sqlite3.connect(home_dir + '/' + db_name)
+    if uuid:
+        where_sql = ' WHERE uuid = ?;'
+        param = uuid
+    elif alias:
+        where_sql = 'WHERE alias = ?;'
+        param = alias
+    else:
+        where_sql = ';'
+    conn.cursor().execute('UPDATE QueryData SET dynamic_table_name = NULL' + where_sql, (param,))
+    conn.commit()
+    conn.close()
+    return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+
+def list_dynamic_tables(alias = None):
+    conn = sqlite3.connect(home_dir + '/' + db_name)
+    conn.row_factory = dict_factory
+    cur = conn.cursor()
+    if alias:
+        cur.execute('SELECT * FROM QueryData WHERE dynamic_table_name IS NOT NULL AND alias = ?;', (alias,))
+    else:
+        cur.execute('SELECT alias, uuid, dynamic_table_name FROM QueryData WHERE dynamic_table_name IS NOT NULL;')
+    results = cur.fetchall()
+
+    conn.close()
+    return results
+
+def construct_dynamic_table(dynamic_table_name):
+    conn = sqlite3.connect(home_dir + '/' + db_name)
+    conn.row_factory = dict_factory
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM QueryData WHERE dynamic_table_name = ?;', (dynamic_table_name,))
+    result = cur.fetchone()
+    if not result:
+        return None
+    rows = json.loads(result["rows"])
+    columnheaders = json.loads(result["columns"])
+    output = []
+    sql = ''
+    for row in rows:
+        output.append(",".join(str(column) for column in row))
+    sql += "),(".join(str(column) for column in output)
+    sql = '(VALUES(' + sql + ')) ' + result['dynamic_table_name'] + ' (' + ",".join(str(column['name']) for column in columnheaders) + ')'
+    return sql
+
+
+app = Flask(__name__)
+@app.route("/query", methods=['POST'])
+def app_query():
+    alias = request.form.get('alias', 'Vagrant')
+    sql = request.form['query']
+    uid = to_str(uuid.uuid1())
+    sstatus = server_status(alias)
+    if not sstatus['success']:
+        return Response(to_str(json.dumps(sstatus)), mimetype='text/json')
+    queue_query(alias, sql, uid)
+    return Response(to_str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
+
+@app.route("/result/<uuid>")
+def app_result(uuid):
+    return fetch_result(uuid)
+
 @app.route("/completions", methods=['POST'])
-def completions():
+def app_completions():
     pos = request.form['pos']
     query = request.form['query']
     alias = request.form.get('alias', 'Vagrant')
@@ -322,7 +416,7 @@ def completions():
     return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected to server.'})), mimetype='text/json')
 
 @app.route("/listservers")
-def list_servers():
+def app_list_servers():
     refresh_servers()
     return Response(to_str(json.dumps(serverList)), mimetype='text/json')
 
@@ -331,13 +425,13 @@ def list_connections():
     return Response(to_str(json.dumps(get_connections(), indent=4)), mimetype='text/json')
 
 @app.route("/connect", methods=['POST'])
-def connect():
+def app_connect():
     alias = request.form['alias']
     authkey = request.form['authkey']
     return Response(to_str(json.dumps(connect_server(alias, authkey))), mimetype='text/json')
 
 @app.route("/addserver", methods=['POST'])
-def addserver():
+def app_addserver():
     alias = request.form['alias']
     if next((s for (a, s) in serverList.items() if a == alias), None):
         return Response(to_str(json.dumps({'success':False, 'errormessage':'Server alias already exists.'})), mimetype='text/json')
@@ -348,7 +442,7 @@ def addserver():
         return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
 
 @app.route("/delserver", methods=['POST'])
-def delserver():
+def app_delserver():
     try:
         alias = request.form['alias']
         remove_server(alias)
@@ -357,7 +451,7 @@ def delserver():
         return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
 
 @app.route("/disconnect", methods=['POST'])
-def disconnect():
+def app_disconnect():
     try:
         alias = request.form['alias']
         disconnect_server(alias)
@@ -366,13 +460,43 @@ def disconnect():
         return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
 
 @app.route("/cancel", methods=['POST'])
-def cancel():
+def app_cancel():
     try:
         alias = request.form['alias']
         cancel_execution(alias)
         return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
     except Exception as e:
         return Response(to_str(json.dumps({'success':False, 'errormessage':to_str(e)})), mimetype='text/json')
+
+@app.route("/create_dynamic_table", methods=['POST'])
+def app_create_dynamic_table():
+    uuid = request.form['uuid']
+    name = request.form['name']
+    return create_dynamic_table(uuid, name)
+
+@app.route("/delete_dynamic_table", methods=['POST'])
+def app_delete_dynamic_table():
+    uuid = request.form['uuid']
+    return delete_dynamic_table(uuid, None)
+
+@app.route("/delete_dynamic_tables", methods=['POST'])
+def app_create_dynamic_tables():
+    alias = request.form.get('alias')
+    return delete_dynamic_table(None, alias)
+
+@app.route("/list_dynamic_tables", methods=['POST'])
+def app_list_dynamic_tables():
+    alias = request.form.get('alias')
+    dynamic_tables =  list_dynamic_tables(alias)
+    if dynamic_tables:
+        Response(to_str(json.dumps(dynamic_tables)), mimetype='text/json')
+    else:
+        Response(to_str(json.dumps(None)), mimetype='text/json')
+
+@app.route("/export_dynamic_table", methods=['POST'])
+def app_export_dynamic_table():
+    uuid = request.form['uuid']
+    return to_str(construct_dynamic_table(uuid))
 
 if __name__ == "__main__":
     main()

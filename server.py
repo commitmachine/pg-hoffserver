@@ -1,5 +1,5 @@
 from __future__ import unicode_literals, print_function
-import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, sqlite3
+import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, sqlite3, re
 from flask import Flask, request, Response
 from threading import Lock, Thread
 from multiprocessing import Queue
@@ -66,21 +66,15 @@ def init_db():
 def db_worker():
     conn = sqlite3.connect(home_dir + '/' + db_name)
     while True:
-        try:
-            q = dbSyncQueue.get(block=True, timeout=60)
-            result = q['result']
-            uuid = q['uuid']
-            for r in result:
-                conn.cursor().execute("INSERT INTO QueryData VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                    (r['alias'], to_str(uuid), None, json.dumps(r['columns']), json.dumps(r['rows']),
-                    r['query'], json.dumps(r['notices']),
-                    r['statusmessage'], r['runtime_seconds'], r['error'], r['timestamp']))
-                conn.commit()
-        except Empty:
-            pass
-        #remove old query results from memory
-        #queryResults[:] = [r for r in queryResults
-        #    if r['complete'] and (datetime.strptime(r['timestamp']) - datetime.datetime.now()).seconds + r['runtime_seconds'] > 10]
+        q = dbSyncQueue.get(block=True)
+        result = q['result']
+        uuid = q['uuid']
+        for r in result:
+            conn.cursor().execute("INSERT INTO QueryData VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                (r['alias'], to_str(uuid), None, json.dumps(r['columns']), json.dumps(r['rows']),
+                r['query'], json.dumps(r['notices']),
+                r['statusmessage'], r['runtime_seconds'], r['error'], r['timestamp']))
+            conn.commit()
 
 def to_str(string):
     if sys.version_info < (3,0):
@@ -193,8 +187,7 @@ def new_executor(url, pwd=None, settings=None):
     uri = urlparse(url)
     database = uri.path[1:]  # ignore the leading fwd slash
     dsn = None  # todo: what is this for again
-    return PGExecute(database, uri.username, pwd or uri.password, uri.hostname,
-                     uri.port, dsn)
+    return PGExecute(database, uri.username, pwd or uri.password, uri.hostname, uri.port, dsn)
 
 def swap_completer(comp,alias):
     completers[alias] = comp
@@ -265,7 +258,8 @@ def executor_queue_worker(alias):
                 except psycopg2.Error as e:
                     currentQuery['error'] = to_str(e)
                 if cur.description:
-                    currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code, 'type': type_dict[alias][d.type_code]} for d in cur.description]
+                    currentQuery['columns'] = [{'name': d.name, 'type_code': d.type_code,
+                                                'type': type_dict[alias][d.type_code]} for d in cur.description]
                     currentQuery['rows'] = [format_row(row) for row in cur.fetchall()]
                 #update query result
                 currentQuery['runtime_seconds'] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
@@ -283,9 +277,32 @@ def update_query_with_dynamic_tables(query):
     if not dynamic_tables:
         return query
     for x in dynamic_tables:
-        if '@' + x['dynamic_table_name'] in query:
-            query = query.replace('@' + x['dynamic_table_name'], construct_dynamic_table(x['dynamic_table_name']))
+        if '##' + x['dynamic_table_name'] in query:
+            query = query.replace('##' + x['dynamic_table_name'], construct_dynamic_table(x['dynamic_table_name']))
     return query
+
+def get_word(text, position):
+    #print(text, file=sys.stderr)
+    #print(position, file=sys.stderr)
+    index = text.rfind("##", 0, int(position))
+    if index > -1:
+        return text[index + 1:int(position)]
+
+def find_dynamic_table(query, pos):
+    results = []
+    searchstring = get_word(query, pos)
+    if not searchstring:
+        return None
+    searchstring = re.sub(r'\W+', '', searchstring)
+
+    dynamic_tables = list_dynamic_tables()
+    if not dynamic_tables:
+        return None
+    result = []
+    for x in dynamic_tables:
+        if x['dynamic_table_name'].find(searchstring) > -1:
+            result.append(x['dynamic_table_name'])
+    return result
 
 def dict_factory(cursor, row):
     d = {}
@@ -302,20 +319,20 @@ def fetch_result(uuid):
         cur = conn.cursor()
         cur.execute("SELECT * FROM QueryData WHERE uuid = ?", (to_str(uuid),))
         row = cur.fetchone()
-        result = {
-            'alias': row["alias"],
-            'columns': json.loads(row["columns"]),
-            'rows': json.loads(row["rows"]),
-            'query': row["query"],
-            'notices': json.loads(row["notices"]),
-            'statusmessage': row["statusmessage"],
-            'complete': 'lolz',
-            'executing': False,
-            'timestamp': row["datestamp"],
-            'runtime_seconds': row["runtime_seconds"],
-            'error': row["error"]
-        }
-        if result['alias']:
+        if row:
+            result = {
+                'alias': row["alias"],
+                'columns': json.loads(row["columns"]),
+                'rows': json.loads(row["rows"]),
+                'query': row["query"],
+                'notices': json.loads(row["notices"]),
+                'statusmessage': row["statusmessage"],
+                'complete': 'lolz',
+                'executing': False,
+                'timestamp': row["datestamp"],
+                'runtime_seconds': row["runtime_seconds"],
+                'error': row["error"]
+            }
             return Response(to_str(json.dumps(result)), mimetype='text/json')
         else:
             return Response(to_str(json.dumps({'success':False, 'errormessage':'Unknown uuid.'})), mimetype='text/json')
@@ -384,7 +401,7 @@ def construct_dynamic_table(dynamic_table_name):
     for row in rows:
         output.append(",".join(str(column) for column in row))
     sql += "),(".join(str(column) for column in output)
-    sql = '(VALUES(' + sql + ')) ' + result['dynamic_table_name'] + ' (' + ",".join(str(column['name']) for column in columnheaders) + ')'
+    sql = '(SELECT * FROM (VALUES(' + sql + ')) DT (' + ",".join(str(column['name']) for column in columnheaders) + '))'
     return sql
 
 
@@ -409,10 +426,16 @@ def app_completions():
     pos = request.form['pos']
     query = request.form['query']
     alias = request.form.get('alias', 'Vagrant')
+    dynamic_tables_match = find_dynamic_table(query, pos)
+    dt_out = []
     if alias in completers:
+        if dynamic_tables_match:
+            dt_out = [{'text': c, 'type': 'Dynamic table'} for c in dynamic_tables_match]
         comps = completers[alias].get_completions(
                     Document(text=query, cursor_position=int(pos)), None)
-        return Response(to_str(json.dumps([{'text': c.text, 'type': c._display_meta} for c in comps])), mimetype='text/json')
+        comps_out = [{'text': c.text, 'type': c._display_meta} for c in comps]
+        out = dt_out + comps_out
+        return Response(to_str(json.dumps(out)), mimetype='text/json')
     return Response(to_str(json.dumps({'success':False, 'errormessage':'Not connected to server.'})), mimetype='text/json')
 
 @app.route("/listservers")
@@ -495,8 +518,8 @@ def app_list_dynamic_tables():
 
 @app.route("/export_dynamic_table", methods=['POST'])
 def app_export_dynamic_table():
-    uuid = request.form['uuid']
-    return to_str(construct_dynamic_table(uuid))
+    dynamic_table_name = request.form['dynamic_table_name']
+    return to_str(construct_dynamic_table(dynamic_table_name))
 
 if __name__ == "__main__":
     main()

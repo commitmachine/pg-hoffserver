@@ -3,7 +3,6 @@ import sys, os, json, uuid, datetime, time, psycopg2, sqlparse, sqlite3, re
 from flask import Flask, request, Response
 from threading import Lock, Thread
 from multiprocessing import Queue
-from Queue import Empty
 from collections import defaultdict
 from pgcli.pgexecute import PGExecute
 from pgspecial import PGSpecial

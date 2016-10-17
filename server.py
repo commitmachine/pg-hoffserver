@@ -214,10 +214,17 @@ def get_transaction_status_text(status):
         TRANSACTION_STATUS_UNKNOWN: 'unknown'
     }[status]
 
-def queue_query(alias, sql, uuid):
+def queue_query(uuid, alias, sql):
     executor_queues[alias].put({'sql': sql, 'uuid': uuid})
 
 def executor_queue_worker(alias):
+    executor = executors[alias]
+    if not executor:
+        return
+    while executors[alias].conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
+        time.sleep(2)
+    if executor.conn.closed != 2:
+        time.sleep(2)
     #pick up work from queue
     while alias in serverList and serverList[alias].get('connected'):
         query = executor_queues[alias].get(block=True)
@@ -240,9 +247,6 @@ def executor_queue_worker(alias):
                 'transaction_status':None,
                 'dynamic_alias': None
             })
-        executor = executors[alias]
-        if not executor:
-            return
         with executor.conn.cursor() as cur:
             for n, qr in enumerate(queryResults[uuid]):
                 timestamp_ts = time.mktime(datetime.datetime.now().timetuple())
@@ -289,7 +293,6 @@ def get_word(text, position):
         return text[index + 1:int(position)]
 
 def find_dynamic_table(query, pos):
-    results = []
     searchstring = get_word(query, pos)
     if not searchstring:
         return None
@@ -382,7 +385,6 @@ def list_dynamic_tables(alias = None):
     else:
         cur.execute('SELECT alias, uuid, dynamic_table_name FROM QueryData WHERE dynamic_table_name IS NOT NULL;')
     results = cur.fetchall()
-
     conn.close()
     return results
 
@@ -404,7 +406,6 @@ def construct_dynamic_table(dynamic_table_name):
     sql = '(SELECT * FROM (VALUES(' + sql + ')) DT (' + ",".join(str(column['name']) for column in columnheaders) + '))'
     return sql
 
-
 app = Flask(__name__)
 @app.route("/query", methods=['POST'])
 def app_query():
@@ -414,12 +415,32 @@ def app_query():
     sstatus = server_status(alias)
     if not sstatus['success']:
         return Response(to_str(json.dumps(sstatus)), mimetype='text/json')
-    queue_query(alias, sql, uid)
+    queue_query(uid, alias, sql)
     return Response(to_str(json.dumps({'success':True, 'guid':uid, 'Url':'localhost:5000/result/' + uid, 'errormessage':None})), mimetype='text/json')
 
 @app.route("/result/<uuid>")
 def app_result(uuid):
     return fetch_result(uuid)
+
+@app.route("/executing")
+def app_executing():
+    output = []
+    uuid_delete = []
+    for n, uuid in enumerate(queryResults):
+        sync_to_db = True
+        for n, r in enumerate(queryResults[uuid]):
+            if r['executing']:
+                sync_to_db = False
+                timestamp_ts = time.mktime(datetime.datetime.strptime(r["timestamp"], '%Y-%m-%d %H:%M:%S').timetuple())
+                r["runtime_seconds"] = int(time.mktime(datetime.datetime.now().timetuple())-timestamp_ts)
+            r['transaction_status'] = get_transaction_status_text(executors[r['alias']].conn.get_transaction_status())
+            output.append(r)
+        if sync_to_db:
+            dbSyncQueue.put({'result': queryResults[uuid], 'uuid':uuid})
+            uuid_delete.append(uuid)
+    for uuid in uuid_delete:
+        del queryResults[uuid]
+    return Response(to_str(json.dumps(output)), mimetype='text/json')
 
 @app.route("/completions", methods=['POST'])
 def app_completions():

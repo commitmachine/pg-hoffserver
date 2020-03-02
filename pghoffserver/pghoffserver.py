@@ -32,8 +32,10 @@ from psycopg2.extensions import (TRANSACTION_STATUS_IDLE,
                                 STATUS_IN_TRANSACTION,
                                 STATUS_PREPARED)
 
-reload(sys)
-sys.setdefaultencoding('utf8')
+if sys.version_info[0] < 3: # Python 3 uses UTF-8 by default
+    reload(sys)
+    sys.setdefaultencoding('utf8')
+
 home_dir = os.path.expanduser('~/.pghoffserver')
 completers = defaultdict(list)  # Dict mapping urls to pgcompleter objects
 completer_lock = Lock()

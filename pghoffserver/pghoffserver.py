@@ -214,17 +214,18 @@ def remove_server(alias):
     write_config()
 
 def start_hoffeye(alias, query, authkey=None):
-    print(alias, query)
+    id = None
     if hoffeyes[alias] and query:
-        hoffeyes[alias].add_watch(query)
+        id = hoffeyes[alias].add_watch(query)
     else:
         server = serverList.get(alias, None)
         dsn = server.get('dsn')
         executor = new_executor(server['url'], dsn, authkey)
         hoffeyes[alias] = HoffEye(executor)
         if query:
-            hoffeyes[alias].add_watch(query)
+            id = hoffeyes[alias].add_watch(query)
         hoffeyes[alias].start()
+    return id
 
 def stop_hoffeye(alias):
     if hoffeyes[alias]:
@@ -233,6 +234,10 @@ def stop_hoffeye(alias):
 def clear_hoffeye(alias):
     if hoffeyes[alias]:
         hoffeyes[alias].clear()
+
+def remove_hoffeye(alias, id):
+    if hoffeyes[alias]:
+        hoffeyes[alias].remove_watch(id)
 
 def connect_server(alias, authkey=None):
     completer_settings = {
@@ -1054,7 +1059,14 @@ def new_hoffeye():
     alias = request.form.get('alias')
     authkey = request.form.get('authkey')
     query = request.form.get('query')
-    start_hoffeye(alias, query, authkey)
+    id = start_hoffeye(alias, query, authkey)
+    return Response(to_str(json.dumps({'success':True, 'id':id, 'errormessage':None})), mimetype='text/json')
+
+@app.route("/hoffeye_remove", methods=['POST'])
+def hoffeye_remove():
+    alias = request.form.get('alias')
+    id = request.form.get('id')
+    remove_hoffeye(alias, id)
     return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
 
 @app.route("/hoffeye_result", methods=['POST'])

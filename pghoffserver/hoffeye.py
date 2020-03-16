@@ -1,4 +1,4 @@
-import time, sys
+import time, sys, random, string
 from collections import defaultdict
 from threading import Thread
 import copy
@@ -46,10 +46,15 @@ class HoffEye:
             self.t.setDaemon(True)
             self.t.start()
 
+    def remove_watch(self, id):
+        self.watchedQueries = [a for a in self.watchedQueries if a['id'] != id]
+
     def add_watch(self, query):
+        id = ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase) for _ in range(20))
         self.watchedQueries.append(
             {
                 'sql' : query,
+                'id' : id,
                 'result': {
                         'columns': None,
                         'rows': None,
@@ -59,6 +64,7 @@ class HoffEye:
                 }
             }
         )
+        return id
 
     def watch_queries(self):
         while self.watching:
@@ -83,7 +89,7 @@ class HoffEye:
                             query['result']['rows'].append(rowdict)
                             for col, data in zip(columns, row):
                                 rowdict[col["field"]] = data
-                                col['data_length'] = max(len(self.to_str(data)), col['data_length'])
+                                col['data_length'] = max(len(to_str(data)), col['data_length'])
                     #update query result
                     query['result']['statusmessage'] = cur.statusmessage
                     notices = []

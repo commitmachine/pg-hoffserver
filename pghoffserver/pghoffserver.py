@@ -214,6 +214,7 @@ def remove_server(alias):
     write_config()
 
 def start_hoffeye(alias, query, authkey=None):
+    print('starting hoffeye')
     id = None
     if hoffeyes[alias] and query:
         id = hoffeyes[alias].add_watch(query)
@@ -320,6 +321,21 @@ def refresh_servers():
                     del executors[alias]
         else:
             server['connected'] = False
+        if alias in hoffeyes:
+            try:
+                if hoffeyes.get(alias).executor.conn.closed == 0:
+                    server['hoffeye_connected'] = True
+                    print('connected!')
+                else:
+                    print('disconnected!')
+                    server['hoffeye_connected'] = False
+                    del hoffeyes[alias]
+            except Exception:
+                print('EXCEPTION!', Exception)
+                server['hoffeye_connected'] = False
+                del hoffeyes[alias]
+        else:
+            server['hoffeye_connected'] = False
 
 def server_status(alias):
     with executor_lock[alias]:
@@ -1059,6 +1075,8 @@ def new_hoffeye():
     alias = request.form.get('alias')
     authkey = request.form.get('authkey')
     query = request.form.get('query')
+    if not executors.get(alias):
+        return Response(to_str(json.dumps({'success':False, 'errormessage':'Unknown alias'})), mimetype='text/json')
     id = start_hoffeye(alias, query, authkey)
     return Response(to_str(json.dumps({'success':True, 'id':id, 'errormessage':None})), mimetype='text/json')
 

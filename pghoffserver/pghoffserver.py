@@ -821,23 +821,20 @@ def write_csv_file(queryid, options, path):
         result = cur.fetchone()
         rows = json.loads(result["rows"])
         columns = json.loads(result["columns"])
-
     if not result:
         return False
 
-    fieldnames = [x['name'] for x in columns]
     with open(path, 'w') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=(str(options.get('delimiter') or ';') if options else str(';')), quoting=csv.QUOTE_ALL)
-        writer.writeheader()
+        spamwriter = csv.writer(csvfile, delimiter=str(u',').encode('utf-8'), quotechar=str(u'"').encode('utf-8'), quoting=csv.QUOTE_MINIMAL)
+        spamwriter.writerow([x['name'] for x in columns])
+
+        outputRows = []
         for row in rows:
-            out = '{'
             for column in columns:
-                if row[column['field']]:
-                    out += "'''" + to_str(column['name']) + "''':'''" + to_str(row[column['field']]) + "''',"
-
-            out = out[:-1] + '}'
-            writer.writerow(ast.literal_eval(out))
-
+                outputRows.append(row[column['field']])
+            spamwriter.writerow(outputRows)
+            del outputRows[:]
+        return True
     return True
 
 app = Flask(__name__)

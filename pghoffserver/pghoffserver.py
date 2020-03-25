@@ -197,6 +197,21 @@ def generateTable (tbl, borderHorizontal = '-', borderVertical = '|', borderCros
         ret += '\n' + s
     return ret
 
+def read_snippets_config():
+    try:
+        with open(home_dir + '/snippets.json') as json_data_file:
+            snippets = json.load(json_data_file, object_pairs_hook=OrderedDict)
+            if snippets == None:
+                snippets = {}
+
+            return snippets
+    except Exception as e:
+        return {}
+
+def write_snippets_config(c):
+    with open(home_dir + '/snippets.json', mode='w') as configfile:
+        json.dump(c, configfile)
+
 def write_config():
     with open(home_dir + '/config.json', mode='w') as configfile:
         json.dump(config, configfile)
@@ -1086,6 +1101,46 @@ def hoffeye_start():
     alias = request.form.get('alias')
     start_hoffeye(alias, None, None)
     return Response(to_str(json.dumps({'success':True, 'errormessage':None})), mimetype='text/json')
+
+@app.route("/list_snippets", methods=['POST'])
+def list_snippets():
+    column = request.form.get('alias')
+    snippets = read_snippets_config()
+
+    if snippets == None:
+        snippets = {}
+
+    return Response(to_str(json.dumps({'success':True, 'snippets': snippets })), mimetype='text/json')
+
+@app.route("/set_snippet", methods=['POST'])
+def set_snippet():
+    id = request.form.get('id')
+    column = request.form.get('column')
+    name = request.form.get('name')
+    sql = request.form.get('sql')
+
+    if id == None or column == None or name == None or sql == None:
+        raise Exception("id, column, name, sql must be set")
+
+
+    snippets = read_snippets_config()
+
+    if not column in snippets:
+        snippets[column] = {}
+
+    if not id in snippets:
+        snippets[column][id] = {}
+
+    snippets[column][id] = {
+        'id': id,
+        'column': column,
+        'name': name,
+        'sql': sql
+    }
+
+    write_snippets_config(snippets)
+
+    return Response(to_str(json.dumps({'success':True })), mimetype='text/json')
 
 @app.route("/hoffeye_clear", methods=['POST'])
 def hoffeye_clear():
